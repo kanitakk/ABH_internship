@@ -3,14 +3,11 @@ import pandas as pd
 from pandas.io.json import json_normalize
 import config
 import time
-config_ = config.Config()
 import numpy as np
 import psycopg2
 import itertools
 from fuzzywuzzy import fuzz
-import sys
-#sys.path.insert(0, '')
-#import py_file
+config_ = config.Config()
 
 
 def flatten_json(y: dict) -> dict:
@@ -195,9 +192,9 @@ def geocode_data():
 
 
 def intersect_geometries(radius):
-    conn = psycopg2.connect("dbname=dataset user=postgres password= host=localhost")
+    conn = psycopg2.connect("dbname=dataset user=postgres password=kkk123 host=localhost")
     cur = conn.cursor()
-    cur.execute("select az.business_id as yelp_id, az.name as yelp_name, az.categories, osm.osm_id as osm_id, osm.name as osm_name, osm.fclass from business_az as az, osm_pois_points as osm where ST_Intersects(ST_Buffer(az.geom, " + str(radius) +"), osm.geom) and osm.name is not null")
+    cur.execute("select az.business_id as yelp_id, az.name as yelp_name, az.categories, osm.osm_id as osm_id, osm.name as osm_name, osm.fclass from business_az as az, osm_pois as osm where ST_Intersects(ST_Buffer(az.geom, " + str(radius) +"), osm.geom) and osm.name is not null")
     rows = cur.fetchall()
     df = pd.DataFrame(rows, columns=['yelp_id', 'yelp_name', 'categories', 'osm_id', 'osm_name', 'fclass'])
     grouped_yelp = df.groupby(by=['yelp_id'])
@@ -207,12 +204,28 @@ def intersect_geometries(radius):
 def fuzzy_match(grouped_df):
     # TODO try with other fuzzy functions and compare results
     matched = []
+    scores_df = pd.DataFrame(columns=['business_id', 'yelp_name', 'osm_name', 'partial_ratio', 'ratio', 'sort_ratio', 'set_ratio'])
     for i, yelp in grouped_df:
         for n, row in yelp.iterrows():
-            fuzz_ration = fuzz.token_set_ratio(row['yelp_name'], row['osm_name'])
-            if fuzz_ration > 80:
-                print(fuzz_ration)
-                matched_pair = row['yelp_name'] + '|' + row['osm_name']
-                print(matched_pair)
+            partial_ratio = fuzz.partial_ratio(row['yelp_name'], row['osm_name'])
+            ratio = fuzz.ratio(row['yelp_name'], row['osm_name'])
+            token_sort_ratio = fuzz.token_sort_ratio(row['yelp_name'], row['osm_name'])
+            set_ration = fuzz.token_set_ratio(row['yelp_name'], row['osm_name'])
+
+            if set_ration > 69:
+                matched_pair = row['yelp_name'] + ' | ' + row['osm_name']
+                # print(matched_pair)
+                #print("partial ration: "+str(partial_ratio))
+                #print("ration: "+str(ratio))
+                #print("token_sort_ratio: "+str(token_sort_ratio))
+                #print("fuzz_ration: "+str(set_ration))
+                #print("\n")
+                scores_df.loc[len(scores_df)] = i, row['yelp_name'], row['osm_name'], partial_ratio, ratio,\
+                                                token_sort_ratio, set_ration
                 matched.append(matched_pair)
+    scores_df.to_csv(config_.path+'\\scores.csv', index=False)
     print(len(matched))
+
+
+a = intersect_geometries(0.001)
+fuzzy_match(a)
