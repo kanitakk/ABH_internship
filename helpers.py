@@ -7,6 +7,8 @@ import numpy as np
 import psycopg2
 import itertools
 from fuzzywuzzy import fuzz
+from nltk.stem import PorterStemmer
+import collections
 config_ = config.Config()
 
 
@@ -97,10 +99,8 @@ def drop_empty_columns(flatten):
     return flatten
 
 
-def get_distinct_values_from_db():
-    conn = psycopg2.connect("dbname=dataset user=postgres password=kkk123 host=localhost")  #connect to db
-    cur = conn.cursor()
-    cur.execute("select distinct(categories) from business where categories is not null")   #get categories from db
+def get_distinct_values_from_db(cur, table_name):
+    cur.execute("select distinct(categories) from "+table_name+" where categories is not null")   #get categories from db
     rows = cur.fetchall()
 
     new_rows = []
@@ -116,8 +116,47 @@ def get_distinct_values_from_db():
     for n in new_rows:
         new_rows2.append(n.strip())     #strip white places
 
-    new_rows2 = list(set(new_rows2))  # after strip 1300 distinct categories
+    new_rows2 = list(set(new_rows2))  # after strip 1300 distinct categories in USA, 1212 only in AZ
     return new_rows2
+
+
+def get_all_categories_from_db(cur, table_name):
+    cur.execute("select categories from " + table_name + " where categories is not null")  # get categories from db
+    rows = cur.fetchall()
+
+    new_rows = []
+    for r in rows:  # convert from tuple to list
+        new_rows.append(list(r))
+
+    new_rows = list(itertools.chain.from_iterable(new_rows))
+    new_rows = ",".join(new_rows)
+    new_rows = new_rows.lower()
+    new_rows = new_rows.split(",")
+    new_rows2 = []
+    # without strip
+    for n in new_rows:
+        new_rows2.append(n.strip())  # strip white places
+
+    return new_rows2
+
+def get_frequency_list_of_categories(categories_list):
+    counter = collections.Counter(categories_list)
+    print(counter)
+
+
+def standardize_categories_and_classes(df, class_type):
+
+    df['osm_class'] = df['osm_class'].lower()
+    df['osm_class'] = df['osm_class'].lower()
+    for i, row in df.iterrows():
+        if class_type == 'osm_class':
+            for key, value in config_.standardized_dict_osm.items():
+                if key in row[class_type]:
+                    row[class_type] = row[class_type].replace(key, value)
+        elif class_type == 'yelp_categories':
+            for key, value in config_.standardized_dict_yelp.items():
+                if key in row[class_type]:
+                    row[class_type] = row[class_type].replace(key, value)
 
 
 def categorize_data(data):
@@ -191,21 +230,15 @@ def geocode_data():
     location.to_csv("D:\\ABH Internship\\yelp_dataset\\coordinatesFromAPI.csv")
 
 
-def intersect_geometries(radius):
-    conn = psycopg2.connect("dbname=dataset user=postgres password=kkk123 host=localhost")
-    cur = conn.cursor()
-    cur.execute("select az.business_id as yelp_id, az.name as yelp_name, az.categories, osm.osm_id as osm_id, osm.name as osm_name, osm.fclass from business_az as az, osm_pois as osm where ST_Intersects(ST_Buffer(az.geom, " + str(radius) +"), osm.geom) and osm.name is not null")
-    rows = cur.fetchall()
+def fuzzy_match(rows):
+    # TODO try with other fuzzy functions and compare results
+    print("Doing fuzzy matching")
+    matched = []
     df = pd.DataFrame(rows, columns=['yelp_id', 'yelp_name', 'categories', 'osm_id', 'osm_name', 'fclass'])
     grouped_yelp = df.groupby(by=['yelp_id'])
-    return grouped_yelp
 
-
-def fuzzy_match(grouped_df):
-    # TODO try with other fuzzy functions and compare results
-    matched = []
     scores_df = pd.DataFrame(columns=['business_id', 'yelp_name', 'osm_name', 'partial_ratio', 'ratio', 'sort_ratio', 'set_ratio'])
-    for i, yelp in grouped_df:
+    for i, yelp in grouped_yelp:
         for n, row in yelp.iterrows():
             partial_ratio = fuzz.partial_ratio(row['yelp_name'], row['osm_name'])
             ratio = fuzz.ratio(row['yelp_name'], row['osm_name'])
@@ -214,18 +247,218 @@ def fuzzy_match(grouped_df):
 
             if set_ration > 69:
                 matched_pair = row['yelp_name'] + ' | ' + row['osm_name']
-                # print(matched_pair)
-                #print("partial ration: "+str(partial_ratio))
-                #print("ration: "+str(ratio))
-                #print("token_sort_ratio: "+str(token_sort_ratio))
-                #print("fuzz_ration: "+str(set_ration))
-                #print("\n")
                 scores_df.loc[len(scores_df)] = i, row['yelp_name'], row['osm_name'], partial_ratio, ratio,\
                                                 token_sort_ratio, set_ration
                 matched.append(matched_pair)
-    scores_df.to_csv(config_.path+'\\scores.csv', index=False)
+    scores_df.to_csv(config_.path+'\\scores.csv', index=False, encoding="latin-1")
     print(len(matched))
 
 
-a = intersect_geometries(0.001)
-fuzzy_match(a)
+def connect_to_database():
+    print("Connecting to database")
+    conn = psycopg2.connect("dbname="+config_.db_name+" user="+config_.db_user+" password="+config_.db_password+" host=localhost")
+    cur = conn.cursor()
+    return cur
+
+
+def intersect_geometries(cur, radius):
+    print("Intersecting osm with yelp points")
+    cur.execute("select az.business_id as yelp_id, az.name as yelp_name, az.categories, osm.osm_id as osm_id,"
+                " osm.name as osm_name, osm.fclass from business_az as az, "
+                "osm_pois_points as osm where ST_Intersects(ST_Buffer(az.geom, " + str(radius) +"), osm.geom) "
+                "and osm.name is not null")
+    rows = cur.fetchall()
+    return rows
+
+
+def get_convex_hull_as_text(curr, table):
+    curr.execute("SELECT ST_AsEWKT(ST_ConvexHull(ST_Collect(" + table + ".geom))) AS convex_hull FROM " + table + ";")
+    polygon = curr.fetchall()
+    return polygon
+
+
+def get_intersection_of_convex_hull_and_osm(curr, convex_hull_string, table):
+    curr.execute("select "+table+".osm_id from "+table+" where ST_Intersects(ST_GeomFromText('" + convex_hull_string + "'), "+table+".geom)")
+    osm_ids = curr.fetchall()
+    return osm_ids
+
+
+def delete_specific_osm_classes(curr, table):
+    query = "delete from "+table+" where fclass in ('waste_basket', 'toilet')"
+    curr.execute(query)
+    geom = curr.fetchall()
+    return geom
+
+
+def buffer_convex_hull(curr, tex_polygon, radius):
+    #TODO adjust for geography
+    query = "select ST_AsEWKT(ST_Buffer(ST_GeomFromText('" + tex_polygon +"'), "+str(radius)+"))"
+    curr.execute(query)
+    buffered_polygon = curr.fetchall()
+    return buffered_polygon
+
+
+def normalize_names(df, osm_col, yelp_col):
+    print("Normalizing name columns")
+    df[osm_col] = df[osm_col].astype(str)
+    df[yelp_col] = df[yelp_col].astype(str)
+    df = to_lower(df, osm_col, yelp_col)
+    df = strip_names(df, osm_col, yelp_col)
+    df = remove_diacritics(df, osm_col, yelp_col)
+    df = replace_special_characters(df, osm_col, yelp_col)
+    return df
+
+
+def remove_diacritics(df, osm_col, yelp_col):
+
+    df[osm_col] = df[osm_col].str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8')
+    df[yelp_col] = df[yelp_col].str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8')
+    return df
+
+
+def replace_special_characters(df, osm_col, yelp_col):
+    df[osm_col] = df[osm_col].str.replace("'", "")
+    df[osm_col] = df[osm_col].str.replace('"', "")
+    df[yelp_col] = df[yelp_col].str.replace("'", "")
+    df[yelp_col] = df[yelp_col].str.replace('"', "")
+
+    # removing right slash
+    df[osm_col] = df[osm_col].str.replace(' / ', " ")
+    df[yelp_col] = df[yelp_col].str.replace(' / ', " ")
+    df[osm_col] = df[osm_col].str.replace('/ ', " ")
+    df[yelp_col] = df[yelp_col].str.replace('/ ', " ")
+    df[osm_col] = df[osm_col].str.replace(' /', " ")
+    df[yelp_col] = df[yelp_col].str.replace(' /', " ")
+    df[osm_col] = df[osm_col].str.replace('/', " ")
+    df[yelp_col] = df[yelp_col].str.replace('/', " ")
+
+    # replacing exclamation mark
+    df[osm_col] = df[osm_col].str.replace('!', "")
+    df[yelp_col] = df[yelp_col].str.replace('!', "")
+
+    # replacing dots
+    df[osm_col] = df[osm_col].str.replace('.', "")
+    df[yelp_col] = df[yelp_col].str.replace('.', "")
+
+    # replacing dash
+    df[osm_col] = df[osm_col].str.replace(' - ', " ")
+    df[yelp_col] = df[yelp_col].str.replace(' - ', " ")
+    df[osm_col] = df[osm_col].str.replace('- ', " ")
+    df[yelp_col] = df[yelp_col].str.replace('- ', " ")
+    df[osm_col] = df[osm_col].str.replace(' -', " ")
+    df[yelp_col] = df[yelp_col].str.replace(' -', " ")
+    df[osm_col] = df[osm_col].str.replace('-', " ")
+    df[yelp_col] = df[yelp_col].str.replace('-', " ")
+
+    # replacing plus
+    try:
+        df[osm_col] = df[osm_col].str.replace(' + ', " ")
+        df[yelp_col] = df[yelp_col].str.replace(' + ', " ")
+        df[osm_col] = df[osm_col].str.replace('+ ', " ")
+        df[yelp_col] = df[yelp_col].str.replace('+ ', " ")
+        df[osm_col] = df[osm_col].str.replace(' +', " ")
+        df[yelp_col] = df[yelp_col].str.replace(' +', " ")
+        df[osm_col] = df[osm_col].str.replace('+', " ")
+        df[yelp_col] = df[yelp_col].str.replace('+', " ")
+    except:
+        df[osm_col] = df[osm_col].str.replace('+', " ")
+        df[yelp_col] = df[yelp_col].str.replace('+', " ")
+
+    # removing underscore
+    df[osm_col] = df[osm_col].str.replace('_', " ")
+    df[yelp_col] = df[yelp_col].str.replace('_', " ")
+
+    return df
+
+
+def strip_names(df, osm_col, yelp_col):
+    df[osm_col] = df[osm_col].str.strip()
+    df[yelp_col] = df[yelp_col].str.strip()
+    return df
+
+
+def to_lower(df, osm_col, yelp_col):
+    df[osm_col] = df[osm_col].str.lower()
+    df[yelp_col] = df[yelp_col].str.lower()
+    return df
+
+
+def standardize_categories(path):
+    df = pd.read_csv(path+'\\business_az.csv', sep='|', low_memory=False)
+    df = df[['business_id', 'name', 'categories']]
+    df['new_categories'] = df['categories']
+    df['new_categories'] = df['new_categories'].str.lower()
+    df['is_changed'] = 0
+
+    for i, row in df.iterrows():
+        if "fast food" in row['new_categories']:
+            row['new_categories'] = "fast_food"
+            row['is_changed'] = 1
+
+        elif "pizza" in row['new_categories']:
+            row['new_categories'] = "fast_food"
+            row['is_changed'] = 1
+
+        elif " pub " in row['new_categories']:
+            row['new_categories'] = "pub"
+            row['is_changed'] = 1
+
+        elif " bar " in row['new_categories']:
+            row['new_categories'] = "bar"
+            row['is_changed'] = 1
+
+        elif " food " in row['new_categories']:
+            row['new_categories'] = "restaurant"
+            row['is_changed'] = 1
+
+        elif " restaurants " in row['new_categories']:
+            row['new_categories'] = "restaurant"
+            row['is_changed'] = 1
+
+
+def fuzzy_match_classes(rows):
+    print("Doing fuzzy matching for categories")
+    matched = []
+    df = pd.DataFrame(rows, columns=['yelp_id', 'osm_id', 'yelp_categories', 'osm_class'])
+    grouped_yelp = df.groupby(by=['yelp_id'])
+    ps = PorterStemmer()
+    scores_df = pd.DataFrame(columns=['business_id', 'yelp_categories', 'osm_class', 'fuzz_ratio'])
+    for i, yelp in grouped_yelp:
+        temp_yelp_lista = []
+        temp_osm_lista = []
+        for n, row in yelp.iterrows():
+            yelp_list = [row['yelp_categories']] #prebaci u listu kompletan string
+            yelp_list = yelp_list[0].split(",") # splita po zarezu
+            yelp_list = [item.strip() for item in yelp_list] # stripuje sve te vrijednosti da ostane "game" a ne " game"
+            yelp_list = [" ".join(yelp_list)] # splituje po space da bi dobili posebno svaku rijec
+
+            for word in yelp_list:
+                temp_yelp_lista.append(ps.stem(word)+" ")
+
+            osm_list = [row['osm_class']]
+            osm_list = [item.strip() for item in osm_list]
+            for word in osm_list:
+                temp_osm_lista.append(ps.stem(word)+" ")
+
+        temp_yelp_lista = " ".join(temp_yelp_lista)
+        temp_yelp_lista = temp_yelp_lista.strip()
+        temp_osm_lista = " ".join(temp_osm_lista)
+        temp_osm_lista = temp_osm_lista.strip()
+
+        fuzz_ratio = fuzz.token_set_ratio(temp_osm_lista, temp_yelp_lista)
+        if fuzz_ratio > 70:
+            matched_pair = row['yelp_categories'] + ' | ' + row['osm_class']
+            scores_df.loc[len(scores_df)] = i, row['yelp_categories'], row['osm_class'], fuzz_ratio
+            matched.append(matched_pair)
+    scores_df.to_csv(config_.path+'\\classes_scores.csv', index=False, encoding="latin-1")
+    print("Number of matched classes: " + str(len(matched)))
+
+
+def intersect_geometries_without_osm_name(cur, radius):
+    print("Intersecting osm with yelp points without osm name")
+    cur.execute("select az.business_id as yelp_id, az.name as yelp_name, az.categories as yelp_categories, osm.osm_id as osm_id,"
+                " osm.fclass as osm_class from business_az as az, "
+                "osm_pois as osm where ST_Intersects(ST_Buffer(az.geom, " + str(radius) +"), osm.geom) "
+                "and osm.name is null")
+    rows = cur.fetchall()
+    return rows
