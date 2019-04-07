@@ -9,6 +9,7 @@ import itertools
 from fuzzywuzzy import fuzz
 from nltk.stem import PorterStemmer
 import collections
+import requests
 config_ = config.Config()
 
 
@@ -199,43 +200,6 @@ def drop_data_with_significant_nulls(data):
     print("Percentage of low quality " + str((num_of_low_quality+25)*100/192609))
 
 
-def geocode_data():
-    import requests
-    import json
-    import pandas as pd
-    import numpy as np
-    from threading import Thread
-    from queue import Queue
-
-    KEY = ""
-
-    df = pd.read_csv("D:\\ABH Internship\\yelp_dataset\\small.csv")
-    df['full_address'] = df['address'] + ', ' + df['city'] + ' ' + df['state'] + ' ' + df['postal_code']
-    addresses = df['full_address']
-    address_list = np.array(addresses)
-    index_list = np.array(addresses.index.tolist())
-
-    location = pd.DataFrame(columns=['Id', 'Adresa', 'Lat', 'Lng'], index=np.arange(0, len(addresses)))
-    num = 0
-    for i in range(len(addresses)):
-        r = requests.get("https://maps.googleapis.com/maps/api/geocode/json?address=Arizona," + str(
-            addresses.Adresa.loc[i]) + "&key=" + KEY)
-        json_string = r.content.decode()
-        json_object = json.loads(json_string)
-        status = json_object['status']
-        if status == 'OK':
-            lat = json_object['results'][0]['geometry']['location']['lat']
-            lng = json_object['results'][0]['geometry']['location']['lng']
-            location.Id.loc[i] = i
-            location.Adresa.loc[i] = addresses.Adresa.loc[i]
-            location.Lat.loc[i] = lat
-            location.Lng.loc[i] = lng
-        print(num)
-        num += 1
-
-    location.to_csv("D:\\ABH Internship\\yelp_dataset\\coordinatesFromAPI.csv")
-
-
 def stemming_match(row, ps, temp_yelp_lista, temp_osm_lista, yelp_column, osm_columns):
     yelp_list = [row[yelp_column]]  # prebaci u listu kompletan string
     yelp_list = yelp_list[0].split(",")  # splita po zarezu
@@ -263,14 +227,30 @@ def yelp_osm_name_intersection(curr, meters, table_name):
 
 
 def yelp_osm_class_intersection(curr, radius_in_meters, table_name):
-    rows = intersect_geometries_without_osm_name(curr, radius_in_meters, 'osm_pois_points')
-    print('There are '+str(len(rows))+'intersected geometries with '+table_name)
+    rows = intersect_geometries_without_osm_name(curr, radius_in_meters, table_name)
+    print('There are '+str(len(rows))+' intersected geometries with '+table_name)
     if table_name == 'osm_pois_points':
         destination = 'standardized_points'
     elif table_name == 'osm_pois':
         destination = 'standardized_polys'
     matched_df = fuzzy_match_standardized_classes(rows, destination)
     return matched_df
+
+
+def create_address_fields_in_osm_table(cur, conn, table_name):
+    cur.execute('alter table '+table_name+' add column address varchar(1000), add column city varchar(1000),'
+                                          ' add column postal_code float(48), add column state varchar(1000)')
+    conn.commit()
+
+
+def update_address_fields_in_osm(curr, conn, path):
+    df = pd.read_csv(path)
+    for i, row in df.iterrows():
+        curr.execute("update "+row['table_name']+" set address = az.address, city = az.city, "\
+                                                 'postal_code = az.postal_code, state = az.state '\
+                                                 "from business_az as az where az.business_id = '"+row['business_id']\
+                     + "' and " + row['table_name']+".osm_id = '" + str(row['osm_id']) + "'")
+        conn.commit()
 
 
 def fuzzy_match(rows, table_name):
@@ -302,7 +282,7 @@ def fuzzy_match(rows, table_name):
                 scores_df.loc[len(scores_df)] = i, row['osm_id'], row['yelp_name'], temp_yelp_lista, row['osm_name'],\
                                                 temp_osm_lista, partial_ratio, ratio, token_sort_ratio, set_ration
                 matched.append(matched_pair)
-    scores_df.to_csv(config_.path+'\\scores_with_stemming'+table_name+'.csv', index=False, encoding="latin-1")
+    scores_df.to_csv(config_.path+'\\scores_with_stemming_'+table_name+'.csv', index=False, encoding="latin-1")
     print(len(matched))
     return scores_df
 
@@ -311,7 +291,7 @@ def connect_to_database():
     print("Connecting to database")
     conn = psycopg2.connect("dbname="+config_.db_name+" user="+config_.db_user+" password="+config_.db_password+" host=localhost")
     cur = conn.cursor()
-    return cur
+    return cur, conn
 
 
 def intersect_geometries(cur, radius_in_meters, table_name):
@@ -479,7 +459,7 @@ def fuzzy_match_standardized_classes(rows, destination_name):
     print("Doing fuzzy matching for standardized categories/classes")
     matched = []
     df = pd.DataFrame(rows, columns=['yelp_id', 'osm_id', 'yelp_name', 'yelp_categories', 'osm_class'])
-    df = df[:500]
+    #df = df[:500]
     df['osm_class2'] = df['osm_class']
     df['yelp_categories2'] = df['yelp_categories']
     grouped_yelp = df.groupby(by=['yelp_id'])
